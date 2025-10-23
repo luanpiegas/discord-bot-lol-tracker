@@ -40,6 +40,7 @@ db.exec(`
 const stmts = {
   setGuildConfig: db.prepare('INSERT OR REPLACE INTO guild_configs (guild_id, channel_id) VALUES (?, ?)'),
   getGuildConfig: db.prepare('SELECT * FROM guild_configs WHERE guild_id = ?'),
+  getAllGuildConfigs: db.prepare('SELECT * FROM guild_configs'),
   deleteGuildPlayers: db.prepare('DELETE FROM tracked_players WHERE guild_id = ?'),
   addPlayer: db.prepare('INSERT INTO tracked_players (guild_id, game_name, tag_line, puuid) VALUES (?, ?, ?, ?)'),
   getPlayers: db.prepare('SELECT * FROM tracked_players WHERE guild_id = ?'),
@@ -132,7 +133,7 @@ function createMatchEmbed(match) {
 
 // Auto-check for new matches
 async function autoCheckMatches() {
-  const configs = stmts.getGuildConfig.all();
+  const configs = stmts.getAllGuildConfigs.all();
   
   for (const config of configs) {
     try {
