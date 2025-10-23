@@ -52,6 +52,13 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
+// Export functions for testing
+module.exports = {
+  riotApiRequest,
+  getPuuid,
+  getLastMatch,
+};
+
 // Riot API helper function
 function riotApiRequest(path, region = PLATFORM) {
   return new Promise((resolve, reject) => {
