@@ -6,9 +6,11 @@ const RIOT_API_KEY = process.env.RIOT_API_KEY;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const REGION = 'americas'; // Region for account-v1 (americas, asia, europe, sea)
 const PLATFORM = 'br1'; // Platform for match data (na1, euw1, kr, etc.)
+const CHECK_INTERVAL = 1 * 30 * 1000; // Check every 30 seconds
 
 // In-memory storage (consider using a database for production)
 const guildConfigs = new Map();
+const lastMatchIds = new Map(); // Track last match ID per player
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
@@ -54,10 +56,12 @@ async function getLastMatch(puuid) {
     const matchList = await riotApiRequest(`/lol/match/v5/matches/by-puuid/${puuid}/ids?start=0&count=1`, REGION);
     if (matchList.length === 0) return null;
 
-    const matchData = await riotApiRequest(`/lol/match/v5/matches/${matchList[0]}`, REGION);
+    const matchId = matchList[0];
+    const matchData = await riotApiRequest(`/lol/match/v5/matches/${matchId}`, REGION);
     const participant = matchData.info.participants.find(p => p.puuid === puuid);
 
     return {
+      matchId,
       championName: participant.championName,
       kills: participant.kills,
       deaths: participant.deaths,
@@ -70,6 +74,54 @@ async function getLastMatch(puuid) {
   } catch (error) {
     console.error(`Error fetching match for PUUID ${puuid}:`, error.message);
     return null;
+  }
+}
+
+// Create match embed
+function createMatchEmbed(match) {
+  return new EmbedBuilder()
+    .setTitle(`${match.gameName}#${match.tagLine}`)
+    .setDescription(`**${match.championName}**`)
+    .addFields(
+      { name: 'KDA', value: `${match.kills}/${match.deaths}/${match.assists}`, inline: true },
+      { name: 'Result', value: match.win ? '✅ Victory' : '❌ Defeat', inline: true }
+    )
+    .setColor(match.win ? 0x00FF00 : 0xFF0000)
+    .setTimestamp(match.gameEndTimestamp);
+}
+
+// Auto-check for new matches
+async function autoCheckMatches() {
+  for (const [guildId, config] of guildConfigs.entries()) {
+    try {
+      const channel = await client.channels.fetch(config.channelId);
+      
+      for (const player of config.players) {
+        const match = await getLastMatch(player.puuid);
+        
+        if (match) {
+          const lastMatchKey = `${guildId}-${player.puuid}`;
+          const previousMatchId = lastMatchIds.get(lastMatchKey);
+          
+          // If this is a new match (different from the last one we saw)
+          if (previousMatchId !== match.matchId) {
+            lastMatchIds.set(lastMatchKey, match.matchId);
+            
+            // Only post if we had a previous match (avoid spam on bot restart)
+            if (previousMatchId) {
+              const embed = createMatchEmbed(match);
+              await channel.send({ embeds: [embed] });
+              console.log(`New match posted for ${match.gameName}#${match.tagLine}`);
+            }
+          }
+        }
+        
+        // Small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    } catch (error) {
+      console.error(`Error checking matches for guild ${guildId}:`, error.message);
+    }
   }
 }
 
@@ -109,6 +161,10 @@ client.once('ready', async () => {
   } catch (error) {
     console.error('Error registering commands:', error);
   }
+
+  // Start auto-checking for matches
+  setInterval(autoCheckMatches, CHECK_INTERVAL);
+  console.log(`Auto-check started (every ${CHECK_INTERVAL / 1000} seconds)`);
 });
 
 // Handle slash commands
@@ -139,6 +195,12 @@ client.on('interactionCreate', async interaction => {
       const puuid = await getPuuid(gameName, tagLine);
       if (puuid) {
         players.push({ gameName, tagLine, puuid });
+        
+        // Initialize last match tracking
+        const match = await getLastMatch(puuid);
+        if (match) {
+          lastMatchIds.set(`${guildId}-${puuid}`, match.matchId);
+        }
       }
     }
 
@@ -151,7 +213,7 @@ client.on('interactionCreate', async interaction => {
       players
     });
 
-    await interaction.editReply(`✅ Configuration saved!\n\nChannel: ${channel}\nPlayers tracked: ${players.length}\n\nUse /check to manually fetch matches.`);
+    await interaction.editReply(`✅ Configuration saved!\n\nChannel: ${channel}\nPlayers tracked: ${players.length}\n\n🔄 Auto-posting enabled - new matches will be posted automatically!\n\nUse /check to manually fetch matches.`);
   }
 
   if (commandName === 'check') {
@@ -170,16 +232,7 @@ client.on('interactionCreate', async interaction => {
       const match = await getLastMatch(player.puuid);
       
       if (match) {
-        const embed = new EmbedBuilder()
-          .setTitle(`${match.gameName}#${match.tagLine}`)
-          .setDescription(`**${match.championName}**`)
-          .addFields(
-            { name: 'KDA', value: `${match.kills}/${match.deaths}/${match.assists}`, inline: true },
-            { name: 'Result', value: match.win ? '✅ Victory' : '❌ Defeat', inline: true }
-          )
-          .setColor(match.win ? 0x00FF00 : 0xFF0000)
-          .setTimestamp(match.gameEndTimestamp);
-
+        const embed = createMatchEmbed(match);
         await channel.send({ embeds: [embed] });
         matchesFound++;
       }
@@ -199,7 +252,7 @@ client.on('interactionCreate', async interaction => {
     const playerList = config.players.map(p => `${p.gameName}#${p.tagLine}`).join('\n');
 
     await interaction.reply({
-      content: `**Current Configuration**\n\nChannel: ${channel || 'Not found'}\n\n**Tracked Players:**\n${playerList}`,
+      content: `**Current Configuration**\n\nChannel: ${channel || 'Not found'}\n\n**Tracked Players:**\n${playerList}\n\n🔄 Auto-check: Every ${CHECK_INTERVAL / 1000} seconds`,
       ephemeral: true
     });
   }
