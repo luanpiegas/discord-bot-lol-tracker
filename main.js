@@ -10,7 +10,7 @@ const PLATFORM = 'br1'; // Platform for match data (na1, euw1, kr, etc.)
 const CHECK_INTERVAL = 1 * 30 * 1000; // Check every 30 seconds
 
 // Initialize database
-const db = new Database('bot-data.db');
+const db = new Database(process.env.DB_PATH);
 
 // Create tables
 db.exec(`
