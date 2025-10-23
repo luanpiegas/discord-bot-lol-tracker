@@ -1,5 +1,6 @@
 const { Client, GatewayIntentBits, PermissionFlagsBits, EmbedBuilder, SlashCommandBuilder } = require('discord.js');
 const https = require('https');
+const Database = require('better-sqlite3');
 
 // Configuration
 const RIOT_API_KEY = process.env.RIOT_API_KEY;
@@ -7,6 +8,44 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const REGION = 'americas'; // Region for account-v1 (americas, asia, europe, sea)
 const PLATFORM = 'br1'; // Platform for match data (na1, euw1, kr, etc.)
 const CHECK_INTERVAL = 1 * 30 * 1000; // Check every 30 seconds
+
+// Initialize database
+const db = new Database('bot-data.db');
+
+// Create tables
+db.exec(`
+  CREATE TABLE IF NOT EXISTS guild_configs (
+    guild_id TEXT PRIMARY KEY,
+    channel_id TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS tracked_players (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    game_name TEXT NOT NULL,
+    tag_line TEXT NOT NULL,
+    puuid TEXT NOT NULL,
+    FOREIGN KEY (guild_id) REFERENCES guild_configs(guild_id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS last_matches (
+    guild_id TEXT NOT NULL,
+    puuid TEXT NOT NULL,
+    match_id TEXT NOT NULL,
+    PRIMARY KEY (guild_id, puuid)
+  );
+`);
+
+// Prepared statements
+const stmts = {
+  setGuildConfig: db.prepare('INSERT OR REPLACE INTO guild_configs (guild_id, channel_id) VALUES (?, ?)'),
+  getGuildConfig: db.prepare('SELECT * FROM guild_configs WHERE guild_id = ?'),
+  deleteGuildPlayers: db.prepare('DELETE FROM tracked_players WHERE guild_id = ?'),
+  addPlayer: db.prepare('INSERT INTO tracked_players (guild_id, game_name, tag_line, puuid) VALUES (?, ?, ?, ?)'),
+  getPlayers: db.prepare('SELECT * FROM tracked_players WHERE guild_id = ?'),
+  setLastMatch: db.prepare('INSERT OR REPLACE INTO last_matches (guild_id, puuid, match_id) VALUES (?, ?, ?)'),
+  getLastMatch: db.prepare('SELECT match_id FROM last_matches WHERE guild_id = ? AND puuid = ?')
+};
 
 // In-memory storage (consider using a database for production)
 const guildConfigs = new Map();
@@ -204,7 +243,7 @@ client.on('interactionCreate', async interaction => {
         // Initialize last match tracking
         const match = await getLastMatch(puuid);
         if (match) {
-          lastMatchIds.set(`${guildId}-${puuid}`, match.matchId);
+          stmts.setLastMatch.run(guildId, puuid, match.matchId);
         }
       }
     }
@@ -213,16 +252,21 @@ client.on('interactionCreate', async interaction => {
       return interaction.editReply('Could not find any valid Riot IDs. Please check the names and try again.');
     }
 
-    guildConfigs.set(guildId, {
-      channelId: channel.id,
-      players
+    // Save to database
+    const transaction = db.transaction(() => {
+      stmts.setGuildConfig.run(guildId, channel.id);
+      stmts.deleteGuildPlayers.run(guildId);
+      for (const player of players) {
+        stmts.addPlayer.run(guildId, player.gameName, player.tagLine, player.puuid);
+      }
     });
+    transaction();
 
     await interaction.editReply(`✅ Configuration saved!\n\nChannel: ${channel}\nPlayers tracked: ${players.length}\n\n🔄 Auto-posting enabled - new matches will be posted automatically!\n\nUse /check to manually fetch matches.`);
   }
 
   if (commandName === 'check') {
-    const config = guildConfigs.get(guildId);
+    const config = stmts.getGuildConfig.get(guildId);
     
     if (!config) {
       return interaction.reply({ content: 'Bot not configured. Use /setup first.', ephemeral: true });
@@ -230,10 +274,11 @@ client.on('interactionCreate', async interaction => {
 
     await interaction.deferReply({ ephemeral: true });
 
-    const channel = await client.channels.fetch(config.channelId);
+    const channel = await client.channels.fetch(config.channel_id);
+    const players = stmts.getPlayers.all(guildId);
     let matchesFound = 0;
 
-    for (const player of config.players) {
+    for (const player of players) {
       const match = await getLastMatch(player.puuid);
       
       if (match) {
@@ -243,24 +288,32 @@ client.on('interactionCreate', async interaction => {
       }
     }
 
-    await interaction.editReply(`✅ Checked ${config.players.length} players. Found ${matchesFound} matches.`);
+    await interaction.editReply(`✅ Checked ${players.length} players. Found ${matchesFound} matches.`);
   }
 
   if (commandName === 'config') {
-    const config = guildConfigs.get(guildId);
+    const config = stmts.getGuildConfig.get(guildId);
     
     if (!config) {
       return interaction.reply({ content: 'Bot not configured. Use /setup first.', ephemeral: true });
     }
 
-    const channel = await client.channels.fetch(config.channelId).catch(() => null);
-    const playerList = config.players.map(p => `${p.gameName}#${p.tagLine}`).join('\n');
+    const channel = await client.channels.fetch(config.channel_id).catch(() => null);
+    const players = stmts.getPlayers.all(guildId);
+    const playerList = players.map(p => `${p.game_name}#${p.tag_line}`).join('\n');
 
     await interaction.reply({
       content: `**Current Configuration**\n\nChannel: ${channel || 'Not found'}\n\n**Tracked Players:**\n${playerList}\n\n🔄 Auto-check: Every ${CHECK_INTERVAL / 1000} seconds`,
       ephemeral: true
     });
   }
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('Shutting down...');
+  db.close();
+  process.exit(0);
 });
 
 // Login
