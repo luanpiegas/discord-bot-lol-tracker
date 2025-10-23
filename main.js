@@ -136,20 +136,23 @@ function createMatchEmbed(match) {
 
 // Auto-check for new matches
 async function autoCheckMatches() {
-  for (const [guildId, config] of guildConfigs.entries()) {
+  const configs = stmts.getGuildConfig.all();
+  
+  for (const config of configs) {
     try {
-      const channel = await client.channels.fetch(config.channelId);
+      const channel = await client.channels.fetch(config.channel_id);
+      const players = stmts.getPlayers.all(config.guild_id);
       
-      for (const player of config.players) {
+      for (const player of players) {
         const match = await getLastMatch(player.puuid);
         
         if (match) {
-          const lastMatchKey = `${guildId}-${player.puuid}`;
-          const previousMatchId = lastMatchIds.get(lastMatchKey);
+          const lastMatchRow = stmts.getLastMatch.get(config.guild_id, player.puuid);
+          const previousMatchId = lastMatchRow?.match_id;
           
           // If this is a new match (different from the last one we saw)
           if (previousMatchId !== match.matchId) {
-            lastMatchIds.set(lastMatchKey, match.matchId);
+            stmts.setLastMatch.run(config.guild_id, player.puuid, match.matchId);
             
             // Only post if we had a previous match (avoid spam on bot restart)
             if (previousMatchId) {
@@ -164,7 +167,7 @@ async function autoCheckMatches() {
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
     } catch (error) {
-      console.error(`Error checking matches for guild ${guildId}:`, error.message);
+      console.error(`Error checking matches for guild ${config.guild_id}:`, error.message);
     }
   }
 }
