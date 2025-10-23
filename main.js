@@ -47,10 +47,6 @@ const stmts = {
   getLastMatch: db.prepare('SELECT match_id FROM last_matches WHERE guild_id = ? AND puuid = ?')
 };
 
-// In-memory storage (consider using a database for production)
-const guildConfigs = new Map();
-const lastMatchIds = new Map(); // Track last match ID per player
-
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
