@@ -69,7 +69,10 @@ async function getLastMatch(puuid) {
       win: participant.win,
       gameName: participant.riotIdGameName,
       tagLine: participant.riotIdTagline,
-      gameEndTimestamp: matchData.info.gameEndTimestamp
+      gameEndTimestamp: matchData.info.gameEndTimestamp,
+      gameMode: matchData.info.gameMode,
+      gameDuration: matchData.info.gameDuration,
+      totalDamageDealtToChampions: participant.totalDamageDealtToChampions
     };
   } catch (error) {
     console.error(`Error fetching match for PUUID ${puuid}:`, error.message);
@@ -80,11 +83,13 @@ async function getLastMatch(puuid) {
 // Create match embed
 function createMatchEmbed(match) {
   return new EmbedBuilder()
-    .setTitle(`${match.gameName}#${match.tagLine}`)
-    .setDescription(`**${match.championName}**`)
+    .setTitle(`${match.gameName} (${match.championName})`)
+    .setDescription(`${match.gameMode} (${match.gameDuration / 60 | 0}:${match.gameDuration % 60})`)
+    .setImage(`https://ddragon.leagueoflegends.com/cdn/12.18.1/img/champion/${match.championName}.png`)
     .addFields(
+      { name: 'Match ID', value: match.matchId, inline: false },
       { name: 'KDA', value: `${match.kills}/${match.deaths}/${match.assists}`, inline: true },
-      { name: 'Result', value: match.win ? '✅ Victory' : '❌ Defeat', inline: true }
+      { name: 'DMG', value: `${match.totalDamageDealtToChampions}`, inline: true },
     )
     .setColor(match.win ? 0x00FF00 : 0xFF0000)
     .setTimestamp(match.gameEndTimestamp);
