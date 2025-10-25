@@ -1,0 +1,21 @@
+.git
+.gitignore
+
+node_modules
+npm-debug.log
+
+.env
+
+*.db
+
+__tests__
+coverage
+
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
