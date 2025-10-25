@@ -96,7 +96,7 @@ async function getPuuid(gameName, tagLine) {
 // Get last match for a player
 async function getLastMatch(puuid) {
   try {
-    const matchList = await riotApiRequest(`/lol/match/v5/matches/by-puuid/${puuid}/ids?start=0&count=1`, REGION);
+    const matchList = await riotApiRequest(`/lol/match/v5/matches/by-puuid/${puuid}/ids?type=ranked&start=0&count=1`, REGION);
     if (matchList.length === 0) return null;
 
     const matchId = matchList[0];
