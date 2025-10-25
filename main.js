@@ -63,6 +63,51 @@ module.exports = {
   getLastMatch,
 };
 
+// ---- DDragon (Data Dragon) latest version helper ----
+let ddragonVersion = null;
+let ddragonLastFetch = 0;
+const DDRAGON_CACHE_MS = 10 * 60 * 1000; // refresh every 10 minutes
+
+function fetchJsonViaHttps(url) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const options = {
+      hostname: u.hostname,
+      path: u.pathname + (u.search || ''),
+      method: 'GET',
+    };
+    https.get(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+        } else {
+          reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+        }
+      });
+    }).on('error', reject);
+  });
+}
+
+async function getDDragonVersion() {
+  const now = Date.now();
+  if (ddragonVersion && (now - ddragonLastFetch) < DDRAGON_CACHE_MS) return ddragonVersion;
+  try {
+    const versions = await fetchJsonViaHttps('https://ddragon.leagueoflegends.com/api/versions.json');
+    if (Array.isArray(versions) && versions.length > 0) {
+      ddragonVersion = versions[0];
+      ddragonLastFetch = now;
+      return ddragonVersion;
+    }
+  } catch (e) {
+    console.warn('Failed to fetch DDragon versions, using cached version if available:', e.message);
+    if (ddragonVersion) return ddragonVersion;
+  }
+  // Fallback: attempt a commonly used recent version if nothing cached
+  return '12.18.1';
+}
+
 // In-memory dual-window rate limiter (tokenless, timestamp sliding window)
 const recent1s = [];
 const recent2m = [];
@@ -188,12 +233,13 @@ async function getLastMatch(puuid) {
   }
 }
 
-// Create match embed
-function createMatchEmbed(match) {
+// Create match embed using latest DDragon version
+async function createMatchEmbed(match) {
+  const version = await getDDragonVersion();
   return new EmbedBuilder()
     .setTitle(`${match.gameName} (${match.championName})`)
     .setDescription(`${match.gameMode} (${match.gameDuration / 60 | 0}:${match.gameDuration % 60})`)
-    .setImage(`https://ddragon.leagueoflegends.com/cdn/12.18.1/img/champion/${match.championName}.png`)
+    .setImage(`https://ddragon.leagueoflegends.com/cdn/${version}/img/champion/${match.championName}.png`)
     .addFields(
       { name: 'Match ID', value: match.matchId, inline: false },
       { name: 'KDA', value: `${match.kills}/${match.deaths}/${match.assists}`, inline: true },
@@ -225,7 +271,7 @@ async function autoCheckMatches() {
             
             // Only post if we had a previous match (avoid spam on bot restart)
             if (previousMatchId) {
-              const embed = createMatchEmbed(match);
+              const embed = await createMatchEmbed(match);
               await channel.send({ embeds: [embed] });
               console.log(`New match posted for ${match.gameName}#${match.tagLine}`);
             }
