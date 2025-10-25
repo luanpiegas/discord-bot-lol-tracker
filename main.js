@@ -1,16 +1,21 @@
 const { Client, GatewayIntentBits, PermissionFlagsBits, EmbedBuilder, SlashCommandBuilder } = require('discord.js');
-const https = require('https');
-const Database = require('better-sqlite3');
+  const https = require('https');
+  const Database = require('better-sqlite3');
 
-// Configuration
-const RIOT_API_KEY = process.env.RIOT_API_KEY;
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const REGION = 'americas'; // Region for account-v1 (americas, asia, europe, sea)
-const PLATFORM = 'br1'; // Platform for match data (na1, euw1, kr, etc.)
-const CHECK_INTERVAL = 1 * 30 * 1000; // Check every 30 seconds
+  // Configuration
+  const RIOT_API_KEY = process.env.RIOT_API_KEY;
+  const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+  const REGION = 'americas'; // Region for account-v1 (americas, asia, europe, sea)
+  const PLATFORM = 'br1'; // Platform for match data (na1, euw1, kr, etc.)
+  const CHECK_INTERVAL = 1 * 30 * 1000; // Check every 30 seconds
+  // Riot API rate limits to enforce locally
+  const LIMIT_1S = 20; // 20 requests per 1 second
+  const LIMIT_2M = 100; // 100 requests per 2 minutes
+  const WINDOW_1S_MS = 1000;
+  const WINDOW_2M_MS = 2 * 60 * 1000;
 
-// Initialize database
-const db = new Database(process.env.DB_PATH);
+  // Initialize database
+  const db = new Database(process.env.DB_PATH);
 
 // Create tables
 db.exec(`
@@ -47,7 +52,6 @@ const stmts = {
   setLastMatch: db.prepare('INSERT OR REPLACE INTO last_matches (guild_id, puuid, match_id) VALUES (?, ?, ?)'),
   getLastMatch: db.prepare('SELECT match_id FROM last_matches WHERE guild_id = ? AND puuid = ?')
 };
-
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
@@ -59,26 +63,87 @@ module.exports = {
   getLastMatch,
 };
 
+// In-memory dual-window rate limiter (tokenless, timestamp sliding window)
+const recent1s = [];
+const recent2m = [];
+
+async function acquireRateLimitSlot() {
+  // Wait until both windows have capacity, then reserve a slot by pushing now
+  // This serializes callers enough to respect limits while allowing bursts up to limit
+  // NOTE: This is process-local; if you run multiple processes, use a shared store instead
+  // to coordinate.
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const now = Date.now();
+    // Prune timestamps outside windows
+    while (recent1s.length && now - recent1s[0] >= WINDOW_1S_MS) recent1s.shift();
+    while (recent2m.length && now - recent2m[0] >= WINDOW_2M_MS) recent2m.shift();
+
+    if (recent1s.length < LIMIT_1S && recent2m.length < LIMIT_2M) {
+      recent1s.push(now);
+      recent2m.push(now);
+      return; // slot acquired
+    }
+
+    const wait1 = recent1s.length ? WINDOW_1S_MS - (now - recent1s[0]) : 0;
+    const wait2 = recent2m.length ? WINDOW_2M_MS - (now - recent2m[0]) : 0;
+    const wait = Math.max(1, Math.min(wait1 || Infinity, wait2 || Infinity));
+    await new Promise(r => setTimeout(r, wait));
+  }
+}
+
 // Riot API helper function
 function riotApiRequest(path, region = PLATFORM) {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     const options = {
       hostname: `${region}.api.riotgames.com`,
       path: path,
       headers: { 'X-Riot-Token': RIOT_API_KEY }
     };
 
-    https.get(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        if (res.statusCode === 200) {
-          resolve(JSON.parse(data));
+    // Respect local rate limits before sending request
+    await acquireRateLimitSlot();
+
+    const attempt = (retryCount = 0) => {
+      https.get(options, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          const status = res.statusCode || 0;
+          if (status === 200) {
+            try {
+              resolve(JSON.parse(data));
+            } catch (e) {
+              reject(new Error(`API Parse Error: ${e.message}`));
+            }
+            return;
+          }
+
+          // Handle rate limiting and transient server errors with retries
+          if (status === 429 || (status >= 500 && status < 600)) {
+            const retryAfterHeader = res.headers && (res.headers['retry-after'] || res.headers['Retry-After']);
+            const retryAfterSec = retryAfterHeader ? parseFloat(retryAfterHeader) : NaN;
+            const backoff = !isNaN(retryAfterSec)
+              ? Math.max(1000, Math.floor(retryAfterSec * 1000))
+              : Math.min(15000, 1000 * Math.pow(2, retryCount));
+            if (retryCount < 5) {
+              setTimeout(() => attempt(retryCount + 1), backoff);
+              return;
+            }
+          }
+
+          reject(new Error(`API Error: ${status} - ${data}`));
+        });
+      }).on('error', (err) => {
+        if (retryCount < 3) {
+          setTimeout(() => attempt(retryCount + 1), 500 * (retryCount + 1));
         } else {
-          reject(new Error(`API Error: ${res.statusCode} - ${data}`));
+          reject(err);
         }
       });
-    }).on('error', reject);
+    };
+
+    attempt(0);
   });
 }
 
@@ -167,8 +232,7 @@ async function autoCheckMatches() {
           }
         }
         
-        // Small delay to avoid rate limiting
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        // Rely on internal rate limiter to pace requests
       }
     } catch (error) {
       console.error(`Error checking matches for guild ${config.guild_id}:`, error.message);
