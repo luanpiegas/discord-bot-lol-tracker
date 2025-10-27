@@ -1,5 +1,4 @@
 import { Client, GatewayIntentBits, PermissionFlagsBits, EmbedBuilder, SlashCommandBuilder } from 'discord.js';
-import https from 'node:https';
 import sqlite3 from 'node:sqlite3';
 import { RateLimiter } from './rateLimiter.js';
 
@@ -134,58 +133,49 @@ console.log('Initializing rate limiter with limits:', { perSecond: LIMIT_1S, per
 const rateLimiter = new RateLimiter(LIMIT_1S, LIMIT_2M);
 
 // Riot API helper function
-function riotApiRequest(path, region = PLATFORM) {
-  return new Promise(async (resolve, reject) => {
-    const options = {
-      hostname: `${region}.api.riotgames.com`,
-      path: path,
-      headers: { 'X-Riot-Token': RIOT_API_KEY }
-    };
+async function riotApiRequest(path, region = PLATFORM) {
+  await rateLimiter.waitForToken();
 
-    // Wait for rate limit token
-    await rateLimiter.waitForToken();
+  const url = `https://${region}.api.riotgames.com${path}`;
+  const options = {
+    headers: { 'X-Riot-Token': RIOT_API_KEY }
+  };
 
-    const attempt = (retryCount = 0) => {
-      https.get(options, (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-          const status = res.statusCode || 0;
-          if (status === 200) {
-            try {
-              resolve(JSON.parse(data));
-            } catch (e) {
-              reject(new Error(`API Parse Error: ${e.message}`));
-            }
-            return;
-          }
+  const attempt = async (retryCount = 0) => {
+    try {
+      const response = await fetch(url, options);
+      const status = response.status;
 
-          // Handle rate limiting and transient server errors with retries
-          if (status === 429 || (status >= 500 && status < 600)) {
-            const retryAfterHeader = res.headers && (res.headers['retry-after'] || res.headers['Retry-After']);
-            const retryAfterSec = retryAfterHeader ? parseFloat(retryAfterHeader) : NaN;
-            const backoff = !isNaN(retryAfterSec)
-              ? Math.max(1000, Math.floor(retryAfterSec * 1000))
-              : Math.min(15000, 1000 * Math.pow(2, retryCount));
-            if (retryCount < 5) {
-              setTimeout(() => attempt(retryCount + 1), backoff);
-              return;
-            }
-          }
+      if (status === 200) {
+        return await response.json();
+      }
 
-          reject(new Error(`API Error: ${status} - ${data}`));
-        });
-      }).on('error', (err) => {
-        if (retryCount < 3) {
-          setTimeout(() => attempt(retryCount + 1), 500 * (retryCount + 1));
-        } else {
-          reject(err);
+      // Handle rate limiting and transient server errors with retries
+      if (status === 429 || (status >= 500 && status < 600)) {
+        const retryAfterSec = parseFloat(response.headers.get('retry-after') || 'NaN');
+        const backoff = !isNaN(retryAfterSec)
+          ? Math.max(1000, Math.floor(retryAfterSec * 1000))
+          : Math.min(15000, 1000 * Math.pow(2, retryCount));
+        
+        if (retryCount < 5) {
+          await new Promise(resolve => setTimeout(resolve, backoff));
+          return attempt(retryCount + 1);
         }
-      });
-    };
+      }
 
-    attempt(0);
-  });
+      const data = await response.text();
+      throw new Error(`API Error: ${status} - ${data}`);
+    } catch (err) {
+      if (err.message.includes('API Error')) throw err;
+      if (retryCount < 3) {
+        await new Promise(resolve => setTimeout(resolve, 500 * (retryCount + 1)));
+        return attempt(retryCount + 1);
+      }
+      throw err;
+    }
+  };
+
+  return attempt(0);
 }
 
 // Get PUUID from Riot ID
