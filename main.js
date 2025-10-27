@@ -1,7 +1,7 @@
-const { Client, GatewayIntentBits, PermissionFlagsBits, EmbedBuilder, SlashCommandBuilder } = require('discord.js');
-const https = require('https');
-const Database = require('better-sqlite3');
-const RateLimiter = require('./rateLimiter');
+import { Client, GatewayIntentBits, PermissionFlagsBits, EmbedBuilder, SlashCommandBuilder } from 'discord.js';
+import https from 'node:https';
+import sqlite3 from 'node:sqlite3';
+import { RateLimiter } from './rateLimiter.js';
 
 // Configuration
 const RIOT_API_KEY = process.env.RIOT_API_KEY;
@@ -9,25 +9,45 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const REGION = 'americas'; // Region for account-v1 (americas, asia, europe, sea)
 const PLATFORM = 'br1'; // Platform for match data (na1, euw1, kr, etc.)
 const BASE_CHECK_INTERVAL = 30 * 1000; // Base interval of 30 seconds
-// Riot API rate limits to enforce locally
+// Riot API rate limits
 const LIMIT_1S = 20; // 20 requests per 1 second
 const LIMIT_2M = 100; // 100 requests per 2 minutes
-const WINDOW_1S_MS = 1000;
-const WINDOW_2M_MS = 2 * 60 * 1000;
 const BATCH_SIZE = 10; // Process players in batches
 
-// Initialize database
+// database
 let db;
 try {
-  db = new Database(process.env.DB_PATH);
+  db = new sqlite3.Database(process.env.DB_PATH);
   console.log(`Connected to database at ${process.env.DB_PATH}`);
 } catch (error) {
   console.error('Failed to connect to database:', error.message);
   process.exit(1);
 }
 
-// Create tables
-db.exec(`
+// database operations
+const dbRun = (sql, params = []) => new Promise((resolve, reject) => {
+  db.run(sql, params, function(err) {
+    if (err) reject(err);
+    else resolve(this);
+  });
+});
+
+const dbGet = (sql, params = []) => new Promise((resolve, reject) => {
+  db.get(sql, params, (err, row) => {
+    if (err) reject(err);
+    else resolve(row);
+  });
+});
+
+const dbAll = (sql, params = []) => new Promise((resolve, reject) => {
+  db.all(sql, params, (err, rows) => {
+    if (err) reject(err);
+    else resolve(rows);
+  });
+});
+
+// Initialize database schema
+await dbRun(`
   CREATE TABLE IF NOT EXISTS guild_configs (
     guild_id TEXT PRIMARY KEY,
     channel_id TEXT NOT NULL
@@ -50,60 +70,52 @@ db.exec(`
   );
 `);
 
-// Prepared statements
+// Database operations wrapper
 const stmts = {
-  setGuildConfig: db.prepare('INSERT OR REPLACE INTO guild_configs (guild_id, channel_id) VALUES (?, ?)'),
-  getGuildConfig: db.prepare('SELECT * FROM guild_configs WHERE guild_id = ?'),
-  getAllGuildConfigs: db.prepare('SELECT * FROM guild_configs'),
-  deleteGuildPlayers: db.prepare('DELETE FROM tracked_players WHERE guild_id = ?'),
-  addPlayer: db.prepare('INSERT INTO tracked_players (guild_id, game_name, tag_line, puuid) VALUES (?, ?, ?, ?)'),
-  getPlayers: db.prepare('SELECT * FROM tracked_players WHERE guild_id = ?'),
-  setLastMatch: db.prepare('INSERT OR REPLACE INTO last_matches (guild_id, puuid, match_id) VALUES (?, ?, ?)'),
-  getLastMatch: db.prepare('SELECT match_id FROM last_matches WHERE guild_id = ? AND puuid = ?')
+  setGuildConfig: (guildId, channelId) => 
+    dbRun('INSERT OR REPLACE INTO guild_configs (guild_id, channel_id) VALUES (?, ?)', [guildId, channelId]),
+  
+  getGuildConfig: (guildId) => 
+    dbGet('SELECT * FROM guild_configs WHERE guild_id = ?', [guildId]),
+  
+  getAllGuildConfigs: () => 
+    dbAll('SELECT * FROM guild_configs'),
+  
+  deleteGuildPlayers: (guildId) => 
+    dbRun('DELETE FROM tracked_players WHERE guild_id = ?', [guildId]),
+  
+  addPlayer: (guildId, gameName, tagLine, puuid) => 
+    dbRun('INSERT INTO tracked_players (guild_id, game_name, tag_line, puuid) VALUES (?, ?, ?, ?)', 
+      [guildId, gameName, tagLine, puuid]),
+  
+  getPlayers: (guildId) => 
+    dbAll('SELECT * FROM tracked_players WHERE guild_id = ?', [guildId]),
+  
+  setLastMatch: (guildId, puuid, matchId) => 
+    dbRun('INSERT OR REPLACE INTO last_matches (guild_id, puuid, match_id) VALUES (?, ?, ?)', 
+      [guildId, puuid, matchId]),
+  
+  getLastMatch: (guildId, puuid) => 
+    dbGet('SELECT match_id FROM last_matches WHERE guild_id = ? AND puuid = ?', [guildId, puuid])
 };
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
-// Export functions for testing
-module.exports = {
-  riotApiRequest,
-  getPuuid,
-  getLastMatch,
-};
-
-// ---- DDragon (Data Dragon) latest version helper ----
+// DDragon (Data Dragon)
 let ddragonVersion = null;
 let ddragonLastFetch = 0;
 const DDRAGON_CACHE_MS = 10 * 60 * 1000; // refresh every 10 minutes
-
-function fetchJsonViaHttps(url) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(url);
-    const options = {
-      hostname: u.hostname,
-      path: u.pathname + (u.search || ''),
-      method: 'GET',
-    };
-    https.get(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        if (res.statusCode === 200) {
-          try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
-        } else {
-          reject(new Error(`HTTP ${res.statusCode}: ${data}`));
-        }
-      });
-    }).on('error', reject);
-  });
-}
 
 async function getDDragonVersion() {
   const now = Date.now();
   if (ddragonVersion && (now - ddragonLastFetch) < DDRAGON_CACHE_MS) return ddragonVersion;
   try {
-    const versions = await fetchJsonViaHttps('https://ddragon.leagueoflegends.com/api/versions.json');
+    const response = await fetch('https://ddragon.leagueoflegends.com/api/versions.json');
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    const versions = await response.json();
     if (Array.isArray(versions) && versions.length > 0) {
       ddragonVersion = versions[0];
       ddragonLastFetch = now;
@@ -118,6 +130,7 @@ async function getDDragonVersion() {
 }
 
 // Initialize the rate limiter
+console.log('Initializing rate limiter with limits:', { perSecond: LIMIT_1S, perTwoMinutes: LIMIT_2M });
 const rateLimiter = new RateLimiter(LIMIT_1S, LIMIT_2M);
 
 // Riot API helper function
@@ -186,34 +199,48 @@ async function getPuuid(gameName, tagLine) {
   }
 }
 
-// Get last match for a player
-async function getLastMatch(puuid) {
+// Get recent matches for a player
+async function getRecentMatches(puuid, count = 5) {
   try {
-    const matchList = await riotApiRequest(`/lol/match/v5/matches/by-puuid/${puuid}/ids?start=0&count=1`, REGION);
-    if (matchList.length === 0) return null;
+    const matchList = await riotApiRequest(`/lol/match/v5/matches/by-puuid/${puuid}/ids?start=0&count=${count}`, REGION);
+    if (matchList.length === 0) return [];
 
-    const matchId = matchList[0];
-    const matchData = await riotApiRequest(`/lol/match/v5/matches/${matchId}`, REGION);
-    const participant = matchData.info.participants.find(p => p.puuid === puuid);
+    const matches = [];
+    for (const matchId of matchList) {
+      try {
+        const matchData = await riotApiRequest(`/lol/match/v5/matches/${matchId}`, REGION);
+        const participant = matchData.info.participants.find(p => p.puuid === puuid);
 
-    return {
-      matchId,
-      championName: participant.championName,
-      kills: participant.kills,
-      deaths: participant.deaths,
-      assists: participant.assists,
-      win: participant.win,
-      gameName: participant.riotIdGameName,
-      tagLine: participant.riotIdTagline,
-      gameEndTimestamp: matchData.info.gameEndTimestamp,
-      gameMode: matchData.info.gameMode,
-      gameDuration: matchData.info.gameDuration,
-      totalDamageDealtToChampions: participant.totalDamageDealtToChampions
-    };
+        matches.push({
+          matchId,
+          championName: participant.championName,
+          kills: participant.kills,
+          deaths: participant.deaths,
+          assists: participant.assists,
+          win: participant.win,
+          gameName: participant.riotIdGameName,
+          tagLine: participant.riotIdTagline,
+          gameEndTimestamp: matchData.info.gameEndTimestamp,
+          gameMode: matchData.info.gameMode,
+          gameDuration: matchData.info.gameDuration,
+          totalDamageDealtToChampions: participant.totalDamageDealtToChampions
+        });
+      } catch (error) {
+        console.error(`Error fetching match ${matchId} for PUUID ${puuid}:`, error.message);
+        // Continue with next match even if one fails
+      }
+    }
+    return matches;
   } catch (error) {
-    console.error(`Error fetching match for PUUID ${puuid}:`, error.message);
-    return null;
+    console.error(`Error fetching matches for PUUID ${puuid}:`, error.message);
+    return [];
   }
+}
+
+// Get last match for a player (for backward compatibility)
+async function getLastMatch(puuid) {
+  const matches = await getRecentMatches(puuid, 1);
+  return matches[0] || null;
 }
 
 // Create match embed using latest DDragon version
@@ -443,15 +470,19 @@ client.on('interactionCreate', async interaction => {
       return interaction.editReply('Could not find any valid Riot IDs. Please check the names and try again.');
     }
 
-    // Save to database
-    const transaction = db.transaction(() => {
-      stmts.setGuildConfig.run(guildId, channel.id);
-      stmts.deleteGuildPlayers.run(guildId);
+    // Save to database using transaction
+    try {
+      await dbRun('BEGIN TRANSACTION');
+      await stmts.setGuildConfig(guildId, channel.id);
+      await stmts.deleteGuildPlayers(guildId);
       for (const player of players) {
-        stmts.addPlayer.run(guildId, player.gameName, player.tagLine, player.puuid);
+        await stmts.addPlayer(guildId, player.gameName, player.tagLine, player.puuid);
       }
-    });
-    transaction();
+      await dbRun('COMMIT');
+    } catch (error) {
+      await dbRun('ROLLBACK');
+      throw error;
+    }
 
     await interaction.editReply(`✅ Configuration saved!\n\nChannel: ${channel}\nPlayers tracked: ${players.length}\n\n🔄 Auto-posting enabled - new matches will be posted automatically!\n\nUse /check to manually fetch matches.`);
   }
@@ -503,8 +534,13 @@ client.on('interactionCreate', async interaction => {
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('Shutting down...');
-  db.close();
-  process.exit(0);
+  db.close((err) => {
+    if (err) {
+      console.error('Error closing database:', err.message);
+      process.exit(1);
+    }
+    process.exit(0);
+  });
 });
 
 // Login

@@ -1,4 +1,4 @@
-class RateLimiter {
+export class RateLimiter {
   constructor(limitPerSecond, limitPerTwoMin) {
     this.limitPerSecond = limitPerSecond;
     this.limitPerTwoMin = limitPerTwoMin;
