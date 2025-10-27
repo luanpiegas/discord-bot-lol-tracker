@@ -13,7 +13,7 @@ const LIMIT_1S = 20; // 20 requests per 1 second
 const LIMIT_2M = 100; // 100 requests per 2 minutes
 const BATCH_SIZE = 10; // Process players in batches
 
-// database
+// Database
 let db;
 try {
   db = new sqlite3.Database(process.env.DB_PATH);
@@ -23,7 +23,7 @@ try {
   process.exit(1);
 }
 
-// database operations
+// Database operations
 const dbRun = (sql, params = []) => new Promise((resolve, reject) => {
   db.run(sql, params, function(err) {
     if (err) reject(err);
