@@ -10,7 +10,7 @@ const client = new Client({
 
 const commands = [setupCommand, trackCommand, listCommand, removeCommand];
 
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log('Bot is ready!');
   processMatches();
 });
@@ -39,7 +39,7 @@ client.on('interactionCreate', async interaction => {
 
 async function processMatches() {
   try {
-    const configs = await db.getAllGuildConfigs();
+    const configs = db.getAllGuildConfigs();
     for (const config of configs) {
       const players = await db.getPlayers(config.guild_id);
       
@@ -118,7 +118,6 @@ async function sendMatchNotification(channelId, player, match) {
 // Initialize database and start the bot
 async function start() {
   try {
-    await db.connect();
     await client.login(config.DISCORD_TOKEN);
   } catch (error) {
     console.error('Failed to start:', error);

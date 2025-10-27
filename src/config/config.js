@@ -1,7 +1,4 @@
 export const config = {
-  RIOT_API_KEY: process.env.RIOT_API_KEY,
-  DISCORD_TOKEN: process.env.DISCORD_TOKEN,
-  DB_PATH: process.env.DB_PATH,
   REGION: 'americas', // Region for account-v1 (americas, asia, europe, sea)
   PLATFORM: 'br1', // Platform for match data (na1, euw1, kr, etc.)
   BASE_CHECK_INTERVAL: 30 * 1000, // Base interval of 30 seconds
@@ -12,3 +9,26 @@ export const config = {
   BATCH_SIZE: 10, // Process players in batches
   DDRAGON_CACHE_MS: 10 * 60 * 1000, // refresh every 10 minutes
 };
+
+export const schema = `
+CREATE TABLE IF NOT EXISTS guild_configs (
+    guild_id TEXT PRIMARY KEY,
+    channel_id TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tracked_players (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    game_name TEXT NOT NULL,
+    tag_line TEXT NOT NULL,
+    puuid TEXT NOT NULL,
+    FOREIGN KEY (guild_id) REFERENCES guild_configs(guild_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS last_matches (
+    guild_id TEXT NOT NULL,
+    puuid TEXT NOT NULL,
+    match_id TEXT NOT NULL,
+    PRIMARY KEY (guild_id, puuid)
+);
+`;
