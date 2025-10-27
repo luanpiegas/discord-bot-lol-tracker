@@ -1,18 +1,20 @@
 const { Client, GatewayIntentBits, PermissionFlagsBits, EmbedBuilder, SlashCommandBuilder } = require('discord.js');
-  const https = require('https');
-  const Database = require('better-sqlite3');
+const https = require('https');
+const Database = require('better-sqlite3');
+const RateLimiter = require('./rateLimiter');
 
-  // Configuration
-  const RIOT_API_KEY = process.env.RIOT_API_KEY;
-  const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-  const REGION = 'americas'; // Region for account-v1 (americas, asia, europe, sea)
-  const PLATFORM = 'br1'; // Platform for match data (na1, euw1, kr, etc.)
-  const CHECK_INTERVAL = 1 * 30 * 1000; // Check every 30 seconds
-  // Riot API rate limits to enforce locally
-  const LIMIT_1S = 20; // 20 requests per 1 second
-  const LIMIT_2M = 100; // 100 requests per 2 minutes
-  const WINDOW_1S_MS = 1000;
-  const WINDOW_2M_MS = 2 * 60 * 1000;
+// Configuration
+const RIOT_API_KEY = process.env.RIOT_API_KEY;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const REGION = 'americas'; // Region for account-v1 (americas, asia, europe, sea)
+const PLATFORM = 'br1'; // Platform for match data (na1, euw1, kr, etc.)
+const BASE_CHECK_INTERVAL = 30 * 1000; // Base interval of 30 seconds
+// Riot API rate limits to enforce locally
+const LIMIT_1S = 20; // 20 requests per 1 second
+const LIMIT_2M = 100; // 100 requests per 2 minutes
+const WINDOW_1S_MS = 1000;
+const WINDOW_2M_MS = 2 * 60 * 1000;
+const BATCH_SIZE = 10; // Process players in batches
 
   // Initialize database
   const db = new Database(process.env.DB_PATH);
@@ -108,34 +110,8 @@ async function getDDragonVersion() {
   return '12.18.1';
 }
 
-// In-memory dual-window rate limiter (tokenless, timestamp sliding window)
-const recent1s = [];
-const recent2m = [];
-
-async function acquireRateLimitSlot() {
-  // Wait until both windows have capacity, then reserve a slot by pushing now
-  // This serializes callers enough to respect limits while allowing bursts up to limit
-  // NOTE: This is process-local; if you run multiple processes, use a shared store instead
-  // to coordinate.
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const now = Date.now();
-    // Prune timestamps outside windows
-    while (recent1s.length && now - recent1s[0] >= WINDOW_1S_MS) recent1s.shift();
-    while (recent2m.length && now - recent2m[0] >= WINDOW_2M_MS) recent2m.shift();
-
-    if (recent1s.length < LIMIT_1S && recent2m.length < LIMIT_2M) {
-      recent1s.push(now);
-      recent2m.push(now);
-      return; // slot acquired
-    }
-
-    const wait1 = recent1s.length ? WINDOW_1S_MS - (now - recent1s[0]) : 0;
-    const wait2 = recent2m.length ? WINDOW_2M_MS - (now - recent2m[0]) : 0;
-    const wait = Math.max(1, Math.min(wait1 || Infinity, wait2 || Infinity));
-    await new Promise(r => setTimeout(r, wait));
-  }
-}
+// Initialize the rate limiter
+const rateLimiter = new RateLimiter(LIMIT_1S, LIMIT_2M);
 
 // Riot API helper function
 function riotApiRequest(path, region = PLATFORM) {
@@ -146,8 +122,8 @@ function riotApiRequest(path, region = PLATFORM) {
       headers: { 'X-Riot-Token': RIOT_API_KEY }
     };
 
-    // Respect local rate limits before sending request
-    await acquireRateLimitSlot();
+    // Wait for rate limit token
+    await rateLimiter.waitForToken();
 
     const attempt = (retryCount = 0) => {
       https.get(options, (res) => {
@@ -249,36 +225,73 @@ async function createMatchEmbed(match) {
     .setTimestamp(match.gameEndTimestamp);
 }
 
+// Helper function to process players in batches
+async function processBatch(players, channel, guildId) {
+  for (const player of players) {
+    try {
+      const match = await getLastMatch(player.puuid);
+      
+      if (match) {
+        const lastMatchRow = stmts.getLastMatch.get(guildId, player.puuid);
+        const previousMatchId = lastMatchRow?.match_id;
+        
+        // If this is a new match (different from the last one we saw)
+        if (previousMatchId !== match.matchId) {
+          stmts.setLastMatch.run(guildId, player.puuid, match.matchId);
+          
+          // Only post if we had a previous match (avoid spam on bot restart)
+          if (previousMatchId) {
+            const embed = await createMatchEmbed(match);
+            await channel.send({ embeds: [embed] });
+            console.log(`New match posted for ${match.gameName}#${match.tagLine}`);
+          }
+        }
+      }
+    } catch (error) {
+      console.error(`Error processing player ${player.game_name}#${player.tag_line}:`, error.message);
+    }
+  }
+}
+
 // Auto-check for new matches
 async function autoCheckMatches() {
   const configs = stmts.getAllGuildConfigs.all();
+  let totalPlayers = 0;
   
+  // First, count total players across all guilds
+  for (const config of configs) {
+    const players = stmts.getPlayers.all(config.guild_id);
+    totalPlayers += players.length;
+  }
+  
+  // Calculate dynamic check interval based on total players
+  // This ensures we stay within rate limits
+  const dynamicInterval = Math.max(
+    BASE_CHECK_INTERVAL,
+    Math.ceil(totalPlayers / 50) * BASE_CHECK_INTERVAL // Increase interval for every 50 players
+  );
+  
+  // Update check interval if needed
+  if (global.checkInterval && global.checkInterval !== dynamicInterval) {
+    clearInterval(global.checkInterval);
+    global.checkInterval = setInterval(autoCheckMatches, dynamicInterval);
+    console.log(`Adjusted check interval to ${dynamicInterval / 1000} seconds for ${totalPlayers} players`);
+  }
+
   for (const config of configs) {
     try {
       const channel = await client.channels.fetch(config.channel_id);
       const players = stmts.getPlayers.all(config.guild_id);
       
-      for (const player of players) {
-        const match = await getLastMatch(player.puuid);
+      // Process players in batches
+      for (let i = 0; i < players.length; i += BATCH_SIZE) {
+        const batch = players.slice(i, i + BATCH_SIZE);
+        await processBatch(batch, channel, config.guild_id);
         
-        if (match) {
-          const lastMatchRow = stmts.getLastMatch.get(config.guild_id, player.puuid);
-          const previousMatchId = lastMatchRow?.match_id;
-          
-          // If this is a new match (different from the last one we saw)
-          if (previousMatchId !== match.matchId) {
-            stmts.setLastMatch.run(config.guild_id, player.puuid, match.matchId);
-            
-            // Only post if we had a previous match (avoid spam on bot restart)
-            if (previousMatchId) {
-              const embed = await createMatchEmbed(match);
-              await channel.send({ embeds: [embed] });
-              console.log(`New match posted for ${match.gameName}#${match.tagLine}`);
-            }
-          }
+        // Add a small delay between batches to help with rate limiting
+        if (i + BATCH_SIZE < players.length) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
         }
-        
-        // Rely on internal rate limiter to pace requests
       }
     } catch (error) {
       console.error(`Error checking matches for guild ${config.guild_id}:`, error.message);
@@ -324,8 +337,9 @@ client.once('ready', async () => {
   }
 
   // Start auto-checking for matches
-  setInterval(autoCheckMatches, CHECK_INTERVAL);
-  console.log(`Auto-check started (every ${CHECK_INTERVAL / 1000} seconds)`);
+  autoCheckMatches(); // Run once immediately to set up the proper interval
+  global.checkInterval = setInterval(autoCheckMatches, BASE_CHECK_INTERVAL);
+  console.log(`Auto-check started (base interval: ${BASE_CHECK_INTERVAL / 1000} seconds)`);
 });
 
 // Handle slash commands
