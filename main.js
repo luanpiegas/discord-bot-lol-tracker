@@ -16,8 +16,15 @@ const WINDOW_1S_MS = 1000;
 const WINDOW_2M_MS = 2 * 60 * 1000;
 const BATCH_SIZE = 10; // Process players in batches
 
-  // Initialize database
-  const db = new Database(process.env.DB_PATH);
+// Initialize database
+let db;
+try {
+  db = new Database(process.env.DB_PATH);
+  console.log(`Connected to database at ${process.env.DB_PATH}`);
+} catch (error) {
+  console.error('Failed to connect to database:', error.message);
+  process.exit(1);
+}
 
 // Create tables
 db.exec(`
@@ -299,9 +306,62 @@ async function autoCheckMatches() {
   }
 }
 
+// Initialize tracked matches from database
+async function initializeTracking() {
+  const configs = stmts.getAllGuildConfigs.all();
+  let initialized = 0;
+  let errors = 0;
+
+  console.log(`Loading configurations for ${configs.length} guilds...`);
+
+  for (const config of configs) {
+    try {
+      // Verify if channel still exists
+      const channel = await client.channels.fetch(config.channel_id);
+      if (!channel) {
+        console.warn(`Channel ${config.channel_id} not found for guild ${config.guild_id}`);
+        continue;
+      }
+
+      const players = stmts.getPlayers.all(config.guild_id);
+      console.log(`Guild ${config.guild_id}: Loading ${players.length} players...`);
+
+      // Initialize last matches if they don't exist
+      for (const player of players) {
+        const lastMatchRow = stmts.getLastMatch.get(config.guild_id, player.puuid);
+        
+        if (!lastMatchRow) {
+          try {
+            const match = await getLastMatch(player.puuid);
+            if (match) {
+              stmts.setLastMatch.run(config.guild_id, player.puuid, match.matchId);
+              console.log(`Initialized last match for ${player.game_name}#${player.tag_line}`);
+            }
+          } catch (error) {
+            console.error(`Error initializing matches for ${player.game_name}#${player.tag_line}:`, error.message);
+            errors++;
+          }
+        }
+      }
+      initialized++;
+    } catch (error) {
+      console.error(`Error initializing guild ${config.guild_id}:`, error.message);
+      errors++;
+    }
+  }
+
+  console.log(`Initialization complete: ${initialized} guilds loaded, ${errors} errors encountered`);
+  return { initialized, errors };
+}
+
 // Register slash commands
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  // Initialize existing configurations
+  console.log('Loading existing configurations...');
+  const initResult = await initializeTracking();
+  console.log(`Loaded ${initResult.initialized} guild configurations`);
 
   const commands = [
     new SlashCommandBuilder()
