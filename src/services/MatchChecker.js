@@ -75,16 +75,18 @@ class MatchChecker {
 
     console.log(`Checking ${allPlayers.length} players across ${configs.length} guilds...`);
     
-    // Process players in batches to respect rate limits
-    const batchSize = config.batching.autoCheckBatchSize;
+    // Use smaller batch size for better rate limiting
+    const batchSize = Math.min(config.batching.autoCheckBatchSize, 10); // Max 10 per batch
+    let processedCount = 0;
+    let newMatchesFound = 0;
     
     for (let i = 0; i < allPlayers.length; i += batchSize) {
       const batch = allPlayers.slice(i, i + batchSize);
       
-      // Process batch concurrently (rate limiter will handle the actual limiting)
+      // Process batch with priority 1 (lowest priority for background checks)
       const promises = batch.map(async (player) => {
         try {
-          const match = await this.riotApi.getLastMatch(player.puuid);
+          const match = await this.riotApi.getLastMatch(player.puuid, 1); // Priority 1 for background checks
           
           if (match) {
             const lastMatchRow = this.database.getLastMatch(player.guild_id, player.puuid);
@@ -101,27 +103,56 @@ class MatchChecker {
                   const embed = EmbedUtils.createMatchEmbed(match);
                   await channel.send({ embeds: [embed] });
                   console.log(`New match posted for ${match.gameName}#${match.tagLine} in guild ${player.guild_id}`);
+                  newMatchesFound++;
                 }
               }
             }
           }
+          processedCount++;
         } catch (error) {
           console.error(`Error checking match for player ${player.game_name}#${player.tag_line}:`, error.message);
+          processedCount++;
         }
       });
       
       // Wait for all requests in this batch to complete
       await Promise.allSettled(promises);
       
-      // Log rate limiter status
+      // Get detailed rate limiter status
       const status = this.riotApi.getRateLimiterStatus();
-      console.log(`Batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(allPlayers.length/batchSize)} complete. Queue: ${status.queueLength}, Last second: ${status.requestsLastSecond}, Last 2min: ${status.requestsLastTwoMinutes}`);
+      const metrics = this.riotApi.rateLimiter.getMetrics();
       
-      // Small delay between batches to prevent overwhelming the API
+      console.log(`Batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(allPlayers.length/batchSize)} complete. ` +
+        `Processed: ${processedCount}/${allPlayers.length}, ` +
+        `New matches: ${newMatchesFound}, ` +
+        `Queue: ${status.totalQueued}, ` +
+        `Last second: ${status.requestsLastSecond}, ` +
+        `Last 2min: ${status.requestsLastTwoMinutes}, ` +
+        `Cache hits: ${metrics.cacheHitRate.toFixed(1)}%`);
+      
+      // Adaptive delay between batches based on rate limiter status
+      let delay = 200; // Base delay
+      
+      // Increase delay if we're approaching rate limits
+      if (status.requestsLastSecond > this.riotApi.rateLimiter.requestsPerSecond * 0.8) {
+        delay = 500;
+      }
+      if (status.requestsLastTwoMinutes > this.riotApi.rateLimiter.requestsPerTwoMinutes * 0.8) {
+        delay = 1000;
+      }
+      
+      // Increase delay if we have consecutive errors
+      if (status.consecutiveErrors > 0) {
+        delay = Math.min(delay * (1 + status.consecutiveErrors), 2000);
+      }
+      
+      // Only delay if there are more batches to process
       if (i + batchSize < allPlayers.length) {
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise(resolve => setTimeout(resolve, delay));
       }
     }
+    
+    console.log(`Auto-check complete. Processed ${processedCount} players, found ${newMatchesFound} new matches.`);
   }
 
   /**

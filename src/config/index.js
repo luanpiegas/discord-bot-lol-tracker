@@ -22,22 +22,22 @@ const config = {
     path: process.env.DB_PATH || './bot-data.db',
   },
 
-  // Rate Limiting Configuration
+  // Rate Limiting Configuration (Conservative settings)
   rateLimiting: {
-    requestsPerSecond: 20,
-    requestsPerTwoMinutes: 100,
+    requestsPerSecond: 18, // 18 instead of 20 for safety margin
+    requestsPerTwoMinutes: 95, // 95 instead of 100 for safety margin
   },
 
-  // Check Intervals
+  // Check Intervals (More conservative)
   intervals: {
-    baseCheckInterval: 30 * 1000, // Base check interval: 30 seconds
-    maxCheckInterval: 5 * 60 * 1000, // Maximum check interval: 5 minutes
+    baseCheckInterval: 60 * 1000, // Base check interval: 60 seconds (was 30)
+    maxCheckInterval: 10 * 60 * 1000, // Maximum check interval: 10 minutes (was 5)
   },
 
-  // Batch Processing
+  // Batch Processing (Smaller batches)
   batching: {
-    autoCheckBatchSize: 20, // Process 20 players at a time (1 second worth of requests)
-    manualCheckBatchSize: 10, // Smaller batches for manual checks
+    autoCheckBatchSize: 8, // Process 8 players at a time (was 20)
+    manualCheckBatchSize: 5, // Smaller batches for manual checks (was 10)
   },
 
   // Validation

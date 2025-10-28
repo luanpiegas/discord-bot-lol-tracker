@@ -7,6 +7,7 @@ const CheckCommand = require('./CheckCommand');
 const ConfigCommand = require('./ConfigCommand');
 const StatusCommand = require('./StatusCommand');
 const RefreshCommand = require('./RefreshCommand');
+const RateLimitCommand = require('./RateLimitCommand');
 
 class CommandManager {
   constructor() {
@@ -24,7 +25,8 @@ class CommandManager {
       new CheckCommand(),
       new ConfigCommand(),
       new StatusCommand(),
-      new RefreshCommand()
+      new RefreshCommand(),
+      new RateLimitCommand()
     ];
 
     commandInstances.forEach(command => {

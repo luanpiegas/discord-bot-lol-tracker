@@ -15,33 +15,74 @@ class RiotApiService {
    * Make a rate-limited request to the Riot API
    * @param {string} path - API endpoint path
    * @param {string} region - API region (default: platform)
+   * @param {Object} options - Request options
+   * @param {number} options.priority - Priority level (1-4, default: 1)
+   * @param {string} options.cacheKey - Optional cache key for deduplication
+   * @param {number} options.timeout - Request timeout in ms (default: 10000)
    * @returns {Promise} - API response
    */
-  async request(path, region = config.riot.platform) {
+  async request(path, region = config.riot.platform, options = {}) {
+    const {
+      priority = 1,
+      cacheKey = null,
+      timeout = 10000
+    } = options;
+
+    // Generate cache key if not provided
+    const finalCacheKey = cacheKey || `${region}:${path}`;
+
     return this.rateLimiter.addRequest(() => {
       return new Promise((resolve, reject) => {
-        const options = {
+        const requestOptions = {
           hostname: `${region}.api.riotgames.com`,
           path: path,
-          headers: { 'X-Riot-Token': config.riot.apiKey }
+          headers: { 
+            'X-Riot-Token': config.riot.apiKey,
+            'User-Agent': 'Discord-LoL-Tracker/1.0'
+          },
+          timeout: timeout
         };
 
-        https.get(options, (res) => {
+        const req = https.get(requestOptions, (res) => {
           let data = '';
           res.on('data', chunk => data += chunk);
           res.on('end', () => {
             if (res.statusCode === 200) {
-              resolve(JSON.parse(data));
+              try {
+                resolve(JSON.parse(data));
+              } catch (parseError) {
+                reject(new Error(`Failed to parse API response: ${parseError.message}`));
+              }
             } else if (res.statusCode === 429) {
-              // Rate limit exceeded
-              const retryAfter = res.headers['retry-after'] || 1;
+              // Rate limit exceeded - extract retry-after header
+              const retryAfter = res.headers['retry-after'] || res.headers['Retry-After'] || 1;
+              const retryAfterMs = parseInt(retryAfter) * 1000;
               reject(new Error(`Rate limit exceeded. Retry after ${retryAfter} seconds`));
+            } else if (res.statusCode === 403) {
+              reject(new Error(`API Key invalid or expired (403)`));
+            } else if (res.statusCode === 404) {
+              reject(new Error(`Resource not found (404)`));
             } else {
               reject(new Error(`API Error: ${res.statusCode} - ${data}`));
             }
           });
-        }).on('error', reject);
+        });
+
+        req.on('error', (error) => {
+          reject(new Error(`Network error: ${error.message}`));
+        });
+
+        req.on('timeout', () => {
+          req.destroy();
+          reject(new Error(`Request timeout after ${timeout}ms`));
+        });
+
+        req.setTimeout(timeout);
       });
+    }, {
+      priority,
+      cacheKey: finalCacheKey,
+      timeout
     });
   }
 
@@ -49,13 +90,20 @@ class RiotApiService {
    * Get PUUID from Riot ID
    * @param {string} gameName - Player's game name
    * @param {string} tagLine - Player's tag line
+   * @param {number} priority - Request priority (default: 2 for manual commands)
    * @returns {Promise<string|null>} - PUUID or null if not found
    */
-  async getPuuid(gameName, tagLine) {
+  async getPuuid(gameName, tagLine, priority = 2) {
     try {
+      const cacheKey = `puuid:${gameName.toLowerCase()}:${tagLine.toLowerCase()}`;
       const data = await this.request(
         `/riot/account/v1/accounts/by-riot-id/${encodeURIComponent(gameName)}/${encodeURIComponent(tagLine)}`,
-        config.riot.region
+        config.riot.region,
+        { 
+          priority,
+          cacheKey,
+          timeout: 15000 // Longer timeout for account lookups
+        }
       );
       return data.puuid;
     } catch (error) {
@@ -67,19 +115,39 @@ class RiotApiService {
   /**
    * Get last match for a player
    * @param {string} puuid - Player's PUUID
+   * @param {number} priority - Request priority (default: 1 for background checks)
    * @returns {Promise<Object|null>} - Match data or null if not found
    */
-  async getLastMatch(puuid) {
+  async getLastMatch(puuid, priority = 1) {
     try {
+      // Get match list with short cache (5 minutes)
+      const matchListCacheKey = `matchlist:${puuid}:ranked:1`;
       const matchList = await this.request(
         `/lol/match/v5/matches/by-puuid/${puuid}/ids?type=ranked&start=0&count=1`,
-        config.riot.region
+        config.riot.region,
+        { 
+          priority,
+          cacheKey: matchListCacheKey,
+          timeout: 10000
+        }
       );
       
       if (matchList.length === 0) return null;
 
       const matchId = matchList[0];
-      const matchData = await this.request(`/lol/match/v5/matches/${matchId}`, config.riot.region);
+      
+      // Get match data with longer cache (30 minutes for completed matches)
+      const matchDataCacheKey = `match:${matchId}`;
+      const matchData = await this.request(
+        `/lol/match/v5/matches/${matchId}`, 
+        config.riot.region,
+        { 
+          priority,
+          cacheKey: matchDataCacheKey,
+          timeout: 15000
+        }
+      );
+      
       const participant = matchData.info.participants.find(p => p.puuid === puuid);
 
       return {
@@ -106,19 +174,35 @@ class RiotApiService {
    * Get multiple matches for a player
    * @param {string} puuid - Player's PUUID
    * @param {number} count - Number of matches to fetch
+   * @param {number} priority - Request priority (default: 2 for manual commands)
    * @returns {Promise<Array>} - Array of match data
    */
-  async getMatches(puuid, count = 5) {
+  async getMatches(puuid, count = 5, priority = 2) {
     try {
+      const matchListCacheKey = `matchlist:${puuid}:ranked:${count}`;
       const matchList = await this.request(
         `/lol/match/v5/matches/by-puuid/${puuid}/ids?type=ranked&start=0&count=${count}`,
-        config.riot.region
+        config.riot.region,
+        { 
+          priority,
+          cacheKey: matchListCacheKey,
+          timeout: 10000
+        }
       );
 
       const matches = [];
       for (const matchId of matchList) {
         try {
-          const matchData = await this.request(`/lol/match/v5/matches/${matchId}`, config.riot.region);
+          const matchDataCacheKey = `match:${matchId}`;
+          const matchData = await this.request(
+            `/lol/match/v5/matches/${matchId}`, 
+            config.riot.region,
+            { 
+              priority,
+              cacheKey: matchDataCacheKey,
+              timeout: 15000
+            }
+          );
           const participant = matchData.info.participants.find(p => p.puuid === puuid);
 
           matches.push({
@@ -150,16 +234,35 @@ class RiotApiService {
   /**
    * Get player's current rank
    * @param {string} puuid - Player's PUUID
+   * @param {number} priority - Request priority (default: 2 for manual commands)
    * @returns {Promise<Object|null>} - Rank data or null if not found
    */
-  async getPlayerRank(puuid) {
+  async getPlayerRank(puuid, priority = 2) {
     try {
-      // First get summoner ID
-      const summonerData = await this.request(`/lol/summoner/v4/summoners/by-puuid/${puuid}`, config.riot.platform);
+      // First get summoner ID with caching
+      const summonerCacheKey = `summoner:${puuid}`;
+      const summonerData = await this.request(
+        `/lol/summoner/v4/summoners/by-puuid/${puuid}`, 
+        config.riot.platform,
+        { 
+          priority,
+          cacheKey: summonerCacheKey,
+          timeout: 10000
+        }
+      );
       const summonerId = summonerData.id;
 
-      // Then get rank data
-      const rankData = await this.request(`/lol/league/v4/entries/by-summoner/${summonerId}`, config.riot.platform);
+      // Then get rank data with caching
+      const rankCacheKey = `rank:${summonerId}`;
+      const rankData = await this.request(
+        `/lol/league/v4/entries/by-summoner/${summonerId}`, 
+        config.riot.platform,
+        { 
+          priority,
+          cacheKey: rankCacheKey,
+          timeout: 10000
+        }
+      );
       
       if (rankData.length === 0) return null;
 
